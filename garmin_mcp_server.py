@@ -1,88 +1,166 @@
 """
-Simplified MCP Server for Garmin Connect Data
+Modular MCP Server for Garmin Connect Data
 """
 
 import asyncio
-import datetime
 import os
+import datetime
+import requests
 from pathlib import Path
 from dotenv import load_dotenv
 
 from mcp.server.fastmcp import FastMCP
 
 # Load environment variables from .env file
-env_path = Path(__file__).parent / '.env'
+env_path = Path(__file__).parent / ".env"
 load_dotenv(dotenv_path=env_path)
 
-from garminconnect import Garmin
+from garth.exc import GarthHTTPError
+from garminconnect import Garmin, GarminConnectAuthenticationError
 
-# Create the Garmin client directly
+# Import all modules
+from modules import activity_management
+from modules import health_wellness
+from modules import user_profile
+from modules import devices
+from modules import gear_management
+from modules import weight_management
+from modules import challenges
+from modules import training
+from modules import workouts
+from modules import data_management
+from modules import womens_health
+
+# Get credentials from environment
 email = os.environ.get("GARMIN_EMAIL")
 password = os.environ.get("GARMIN_PASSWORD")
-garmin_client = Garmin(email, password)
-print(f"Logging in to Garmin Connect with email: {email}")
-garmin_client.login()
-print("Login successful!")
+tokenstore = os.getenv("GARMINTOKENS") or "~/.garminconnect"
+tokenstore_base64 = os.getenv("GARMINTOKENS_BASE64") or "~/.garminconnect_base64"
 
-# Create FastMCP server
-app = FastMCP("Garmin Connect")
 
-@app.tool()
-async def list_activities(limit: int = 5) -> str:
-    """List recent Garmin activities"""
+def init_api(email, password):
+    """Initialize Garmin API with your credentials."""
+
     try:
-        activities = garmin_client.get_activities(0, limit)
-        
-        if not activities:
-            return "No activities found."
-        
-        result = f"Last {len(activities)} activities:\n\n"
-        for idx, activity in enumerate(activities, 1):
-            result += f"--- Activity {idx} ---\n"
-            result += f"Activity: {activity.get('activityName', 'Unknown')}\n"
-            result += f"Type: {activity.get('activityType', {}).get('typeKey', 'Unknown')}\n"
-            result += f"Date: {activity.get('startTimeLocal', 'Unknown')}\n"
-            result += f"ID: {activity.get('activityId', 'Unknown')}\n\n"
-        
-        return result
-    except Exception as e:
-        return f"Error retrieving activities: {str(e)}"
+        # Using Oauth1 and OAuth2 token files from directory
+        print(
+            f"Trying to login to Garmin Connect using token data from directory '{tokenstore}'...\n"
+        )
 
-@app.tool()
-async def get_activity_details(activity_id: str) -> str:
-    """Get detailed information about a specific activity"""
-    try:
-        activity = garmin_client.get_activity_details(activity_id)
-        if not activity:
-            return f"No details found for activity {activity_id}"
-        
-        # Basic formatting of activity details
-        result = f"Activity Details for ID {activity_id}:\n\n"
-        result += f"Name: {activity.get('activityName', 'Unknown')}\n"
-        result += f"Type: {activity.get('activityType', {}).get('typeKey', 'Unknown')}\n"
-        result += f"Date: {activity.get('startTimeLocal', 'Unknown')}\n"
-        
-        return result
-    except Exception as e:
-        return f"Error retrieving activity details: {str(e)}"
+        # Using Oauth1 and Oauth2 tokens from base64 encoded string
+        # print(
+        #     f"Trying to login to Garmin Connect using token data from file '{tokenstore_base64}'...\n"
+        # )
+        # dir_path = os.path.expanduser(tokenstore_base64)
+        # with open(dir_path, "r") as token_file:
+        #     tokenstore = token_file.read()
 
-@app.tool()
-async def get_heart_rate_data(date: str = None) -> str:
-    """Get daily heart rate data"""
-    if not date:
-        date = datetime.date.today().strftime("%Y-%m-%d")
+        garmin = Garmin()
+        garmin.login(tokenstore)
+
+    except (FileNotFoundError, GarthHTTPError, GarminConnectAuthenticationError):
+        # Session is expired. You'll need to log in again
+        print(
+            "Login tokens not present, login with your Garmin Connect credentials to generate them.\n"
+            f"They will be stored in '{tokenstore}' for future use.\n"
+        )
+        try:
+            garmin = Garmin(
+                email=email, password=password, is_cn=False  # , prompt_mfa=get_mfa
+            )
+            garmin.login()
+            # Save Oauth1 and Oauth2 token files to directory for next login
+            garmin.garth.dump(tokenstore)
+            print(
+                f"Oauth tokens stored in '{tokenstore}' directory for future use. (first method)\n"
+            )
+            # Encode Oauth1 and Oauth2 tokens to base64 string and safe to file for next login (alternative way)
+            token_base64 = garmin.garth.dumps()
+            dir_path = os.path.expanduser(tokenstore_base64)
+            with open(dir_path, "w") as token_file:
+                token_file.write(token_base64)
+            print(
+                f"Oauth tokens encoded as base64 string and saved to '{dir_path}' file for future use. (second method)\n"
+            )
+        except (
+            FileNotFoundError,
+            GarthHTTPError,
+            GarminConnectAuthenticationError,
+            requests.exceptions.HTTPError,
+        ) as err:
+            print(err)
+            return None
+
+    return garmin
+
+
+def main():
+    """Initialize the MCP server and register all tools"""
     
-    try:
-        hr_data = garmin_client.get_heart_rates(date)
-        if not hr_data:
-            return f"No heart rate data found for {date}"
-        
-        result = f"Heart Rate Data for {date}:\n\n"
-        result += f"Resting HR: {hr_data.get('restingHeartRate', 0)} bpm\n"
-        
-        return result
-    except Exception as e:
-        return f"Error retrieving heart rate data: {str(e)}"
+    # Initialize Garmin client
+    garmin_client = init_api(email, password)
+    if not garmin_client:
+        print("Failed to initialize Garmin Connect client. Exiting.")
+        return
+    
+    print("Garmin Connect client initialized successfully.")
+    
+    # Configure all modules with the Garmin client
+    activity_management.configure(garmin_client)
+    health_wellness.configure(garmin_client)
+    user_profile.configure(garmin_client)
+    devices.configure(garmin_client)
+    gear_management.configure(garmin_client)
+    weight_management.configure(garmin_client)
+    challenges.configure(garmin_client)
+    training.configure(garmin_client)
+    workouts.configure(garmin_client)
+    data_management.configure(garmin_client)
+    womens_health.configure(garmin_client)
+    
+    # Create the MCP app
+    app = FastMCP("Garmin Connect v1.0")
+    
+    # Register tools from all modules
+    app = activity_management.register_tools(app)
+    app = health_wellness.register_tools(app)
+    app = user_profile.register_tools(app)
+    app = devices.register_tools(app)
+    app = gear_management.register_tools(app)
+    app = weight_management.register_tools(app)
+    app = challenges.register_tools(app)
+    app = training.register_tools(app)
+    app = workouts.register_tools(app)
+    app = data_management.register_tools(app)
+    app = womens_health.register_tools(app)
+    
+    # Add activity listing tool directly to the app
+    @app.tool()
+    async def list_activities(limit: int = 5) -> str:
+        """List recent Garmin activities"""
+        try:
+            activities = garmin_client.get_activities(0, limit)
+
+            if not activities:
+                return "No activities found."
+
+            result = f"Last {len(activities)} activities:\n\n"
+            for idx, activity in enumerate(activities, 1):
+                result += f"--- Activity {idx} ---\n"
+                result += f"Activity: {activity.get('activityName', 'Unknown')}\n"
+                result += (
+                    f"Type: {activity.get('activityType', {}).get('typeKey', 'Unknown')}\n"
+                )
+                result += f"Date: {activity.get('startTimeLocal', 'Unknown')}\n"
+                result += f"ID: {activity.get('activityId', 'Unknown')}\n\n"
+
+            return result
+        except Exception as e:
+            return f"Error retrieving activities: {str(e)}"
+    
+    # Run the MCP server
+    app.run()
+
 
 if __name__ == "__main__":
-    app.run()
+    main()
