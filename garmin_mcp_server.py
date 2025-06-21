@@ -3,9 +3,11 @@ Modular MCP Server for Garmin Connect Data
 """
 
 import asyncio
+import time
 import os
 import datetime
 import requests
+import threading
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -37,6 +39,13 @@ password = os.environ.get("GARMIN_PASSWORD")
 tokenstore = os.getenv("GARMINTOKENS") or "~/.garminconnect"
 tokenstore_base64 = os.getenv("GARMINTOKENS_BASE64") or "~/.garminconnect_base64"
 
+LOGIN_STATE_SUCCESS = 0
+LOGIN_STATE_MFA = 1
+LOGIN_STATE_ERROR = 2
+login_state = None
+need_mfa = None
+mfa_code = None
+lock = threading.Lock()
 
 def init_api(email, password):
     """Initialize Garmin API with your credentials."""
@@ -64,46 +73,98 @@ def init_api(email, password):
             "Login tokens not present, login with your Garmin Connect credentials to generate them.\n"
             f"They will be stored in '{tokenstore}' for future use.\n"
         )
-        try:
-            garmin = Garmin(
-                email=email, password=password, is_cn=False  # , prompt_mfa=get_mfa
-            )
-            garmin.login()
-            # Save Oauth1 and Oauth2 token files to directory for next login
-            garmin.garth.dump(tokenstore)
-            print(
-                f"Oauth tokens stored in '{tokenstore}' directory for future use. (first method)\n"
-            )
-            # Encode Oauth1 and Oauth2 tokens to base64 string and safe to file for next login (alternative way)
-            token_base64 = garmin.garth.dumps()
-            dir_path = os.path.expanduser(tokenstore_base64)
-            with open(dir_path, "w") as token_file:
-                token_file.write(token_base64)
-            print(
-                f"Oauth tokens encoded as base64 string and saved to '{dir_path}' file for future use. (second method)\n"
-            )
-        except (
-            FileNotFoundError,
-            GarthHTTPError,
-            GarminConnectAuthenticationError,
-            requests.exceptions.HTTPError,
-        ) as err:
-            print(err)
-            return None
 
-    return garmin
+        garmin = Garmin(
+            email=email, password=password, is_cn=False, prompt_mfa=get_mfa
+        )
 
+        def login():
+            global login_state
+            try:
+                print("Logging in...")
+                garmin.login()
+            
+                # Save Oauth1 and Oauth2 token files to directory for next login
+                garmin.garth.dump(tokenstore)
+                print(
+                    f"Oauth tokens stored in '{tokenstore}' directory for future use. (first method)\n"
+                )
+                # Encode Oauth1 and Oauth2 tokens to base64 string and safe to file for next login (alternative way)
+                token_base64 = garmin.garth.dumps()
+                dir_path = os.path.expanduser(tokenstore_base64)
+                with open(dir_path, "w") as token_file:
+                    token_file.write(token_base64)
+                print(
+                    f"Oauth tokens encoded as base64 string and saved to '{dir_path}' file for future use. (second method)\n"
+                )
+                
+                with lock:
+                    login_state = LOGIN_STATE_SUCCESS
+            except (
+                FileNotFoundError,
+                GarthHTTPError,
+                GarminConnectAuthenticationError,
+                requests.exceptions.HTTPError,
+            ) as err:
+                print(err)
+                with lock:
+                    login_state = LOGIN_STATE_ERROR
+
+        thread = threading.Thread(target=login)
+        thread.start()
+
+        print('waiting for login or mfa')
+        while True:
+            time.sleep(0.1)
+            with lock:
+                if need_mfa:
+                    return LOGIN_STATE_MFA, garmin
+                if login_state is not None:
+                    if login_state != LOGIN_STATE_SUCCESS:
+                        return LOGIN_STATE_ERROR, None
+                    else:
+                        break
+
+    return LOGIN_STATE_SUCCESS, garmin
+
+def get_mfa() -> str:
+    """
+    Called synchronously by garminconnect.  We block until the user
+    submits the code via the MCP tool below.
+    """
+    global need_mfa, mfa_code
+    print("MFA required")
+    with lock:
+        need_mfa = True
+    
+    # Since we're in a thread, we need to wait synchronously
+    timeout = 1800
+    start_time = time.time()
+    while True:
+        time.sleep(0.1)
+        with lock:
+            if mfa_code:
+                code = mfa_code
+                mfa_code = None
+                need_mfa = False
+                return code
+        if time.time() - start_time > timeout:
+            raise TimeoutError("MFA timeout")
 
 def main():
     """Initialize the MCP server and register all tools"""
     
     # Initialize Garmin client
-    garmin_client = init_api(email, password)
-    if not garmin_client:
+    ls, garmin_client = init_api(email, password)
+    if ls == LOGIN_STATE_ERROR:
         print("Failed to initialize Garmin Connect client. Exiting.")
         return
     
-    print("Garmin Connect client initialized successfully.")
+    if ls == LOGIN_STATE_MFA:
+        print("Garmin Connect client initialized, but MFA is required, need user to enter code before using any tools")
+    
+    if ls == LOGIN_STATE_SUCCESS:
+        print("Garmin Connect client initialized successfully.")
     
     # Configure all modules with the Garmin client
     activity_management.configure(garmin_client)
@@ -157,6 +218,34 @@ def main():
             return result
         except Exception as e:
             return f"Error retrieving activities: {str(e)}"
+
+    if ls == LOGIN_STATE_MFA:
+        # Add tool for entering MFA code
+        @app.tool()
+        async def enter_mfa_code(code: int) -> str:
+            global mfa_code, login_state
+            """
+            Enter MFA code from user to complete login
+            VERY IMPORTANT: THIS MUST BE DONE ONCE BEFORE USING ANY OTHER TOOLS
+            If any tool fails due to OAuth error, you must ask the user to enter the MFA code and run this tool
+            before using any other tools.
+            
+            Args:
+                code (int): MFA code from user (VERY IMPORTANT, you must ask the user to enter this code)
+            """
+            with lock:
+                mfa_code = code
+            start_time = time.time()
+            while True:
+                time.sleep(0.1)
+                with lock:
+                    if login_state is not None:
+                        break
+                if time.time() - start_time > 30:
+                    return "Timed out waiting for login to complete"
+            if login_state == LOGIN_STATE_ERROR:
+                return "Failed to complete login"
+            return "MFA code entered successfully."
     
     # Run the MCP server
     app.run()
